@@ -1,0 +1,499 @@
+
+<canvas id="gameCanvas" width="660" height="480" style="display:block;border-radius:12px;cursor:none;touch-action:none;width:100%;"></canvas>
+<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 4px 4px;">
+  <span style="font-size:13px;color:var(--color-text-secondary);">← → / 마우스로 연잎 이동 | 클릭으로 점프</span>
+  <button id="restartBtn" style="font-size:13px;padding:6px 14px;border-radius:8px;border:0.5px solid var(--color-border-secondary);background:var(--color-background-primary);color:var(--color-text-primary);cursor:pointer;">다시 시작</button>
+</div>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+const PAD_Y = H - 55;
+const FROG_BASE_Y = PAD_Y - 34;
+const JUMP_HEIGHT = 120;
+const JUMP_DURATION = 90;
+
+const GOOD_ITEMS = ['🌸','🌼','🌺','🌻','🌹'];
+const BONUS_ITEM = '🐛';
+const BAD_ITEMS  = ['🦅','🐍','🧑'];
+
+// 물속 배경용 파티클
+const bubbles = Array.from({length:28}, ()=>({
+  x: Math.random()*W,
+  y: Math.random()*H,
+  r: 2+Math.random()*5,
+  speed: 0.3+Math.random()*0.5,
+  alpha: 0.08+Math.random()*0.18,
+}));
+
+// 물고기 배경 장식
+const bgFish = Array.from({length:5}, ()=>({
+  x: Math.random()*W,
+  y: 60+Math.random()*(H-160),
+  speed: 0.4+Math.random()*0.6,
+  dir: Math.random()<0.5?1:-1,
+  size: 14+Math.random()*10,
+  alpha: 0.18+Math.random()*0.15,
+}));
+
+const state = {
+  pad:{ x:W/2, y:PAD_Y, w:100, h:20, targetX:W/2 },
+  frog:{ x:W/2, displayY:FROG_BASE_Y, jumpT:0, jumping:false,
+         jumpFromX:W/2, jumpToX:W/2, facing:1 },
+  score:0, lives:3,
+  over:false, started:false,
+  keys:{},
+  items:[],
+  spawnTimer:75, spawnInterval:100,
+  bonusTimer:400, bonusInterval:500,
+  frame:0,
+  combo:0, comboTimer:0,
+  particles:[], flashMsgs:[],
+  // 난이도
+  level:1, levelTimer:0,
+  baseSpeed:1.5,
+  badRatio:0.25,
+};
+
+function getLevel() {
+  // 30초(1800f)마다 레벨업, 최대 8
+  return Math.min(8, 1 + Math.floor(state.frame / 1800));
+}
+
+function getDifficulty() {
+  const lv = getLevel();
+  return {
+    vy:       1.5 + lv * 0.28,           // 낙하 속도
+    spawnInt: Math.max(42, 100 - lv*7),  // 스폰 간격
+    badRatio: Math.min(0.55, 0.22 + lv*0.04), // 포식자 비율
+    multiChance: lv >= 4 ? (lv-3)*0.12 : 0,   // 동시 2개 스폰 확률
+  };
+}
+
+function resetGame() {
+  Object.assign(state, {
+    score:0, lives:3, over:false, started:true,
+    items:[], frame:0, combo:0, comboTimer:0,
+    particles:[], flashMsgs:[],
+    spawnTimer:75, spawnInterval:100,
+    bonusTimer:400,
+  });
+  state.pad.x=W/2; state.pad.targetX=W/2;
+  Object.assign(state.frog,{
+    x:W/2, displayY:FROG_BASE_Y,
+    jumpT:0, jumping:false,
+    jumpFromX:W/2, jumpToX:W/2, facing:1,
+  });
+}
+
+function spawnItem(kind) {
+  const d = getDifficulty();
+  let emoji;
+  if(kind==='bonus') emoji=BONUS_ITEM;
+  else if(kind==='bad') emoji=BAD_ITEMS[Math.floor(Math.random()*BAD_ITEMS.length)];
+  else emoji=GOOD_ITEMS[Math.floor(Math.random()*GOOD_ITEMS.length)];
+  state.items.push({
+    x: 50+Math.random()*(W-100),
+    y: -34,
+    vy: d.vy + Math.random()*0.4,
+    vx: (Math.random()-0.5)*(0.4+getLevel()*0.07),
+    emoji, kind, r:22, alive:true,
+  });
+}
+
+function triggerJump(toX) {
+  const f=state.frog;
+  if(f.jumping) return;
+  const clamped=Math.max(30,Math.min(W-30,toX));
+  if(Math.abs(clamped-f.x)<5) return;
+  f.jumping=true; f.jumpT=0;
+  f.jumpFromX=f.x; f.jumpToX=clamped;
+  f.facing=clamped>f.x?1:-1;
+}
+
+function addFlash(text,x,y,color) {
+  state.flashMsgs.push({text,x,y,life:50,maxLife:50,color});
+}
+
+function spawnParticle(x,y,emoji,kind) {
+  const e=kind==='bad'?'💢':kind==='bonus'?'💚':emoji;
+  for(let i=0;i<7;i++){
+    const a=(Math.PI*2/7)*i+Math.random()*0.4;
+    state.particles.push({
+      x,y,vx:Math.cos(a)*2.8,vy:Math.sin(a)*2.8-1.2,
+      life:45,maxLife:45,emoji:e,
+    });
+  }
+}
+
+function easeInOut(t){ return t<0.5?2*t*t:-1+(4-2*t)*t; }
+
+// ── 배경: 물속 ──────────────────────────────────
+function drawUnderwater() {
+  // 깊은 바닷속 그라데이션
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#001a33');
+  g.addColorStop(0.5,'#002a4a');
+  g.addColorStop(1,'#001020');
+  ctx.fillStyle=g;
+  ctx.fillRect(0,0,W,H);
+
+  // 빛 줄기 (위에서 내려오는 caustic)
+  ctx.save();
+  for(let i=0;i<5;i++){
+    const bx=80+i*120+Math.sin(Date.now()/2000+i)*18;
+    const glight=ctx.createLinearGradient(bx,0,bx+30,H*0.7);
+    glight.addColorStop(0,'rgba(100,200,255,0.07)');
+    glight.addColorStop(1,'rgba(100,200,255,0)');
+    ctx.fillStyle=glight;
+    ctx.beginPath();
+    ctx.moveTo(bx,0); ctx.lineTo(bx+28,0);
+    ctx.lineTo(bx+50,H*0.7); ctx.lineTo(bx-10,H*0.7);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+
+  // 수면 물결 (상단)
+  ctx.save();
+  ctx.beginPath();
+  for(let x=0;x<=W;x+=4){
+    const wave=Math.sin(x/40+Date.now()/600)*5+Math.sin(x/22+Date.now()/900)*3;
+    x===0?ctx.moveTo(x,wave+8):ctx.lineTo(x,wave+8);
+  }
+  ctx.lineTo(W,0); ctx.lineTo(0,0); ctx.closePath();
+  ctx.fillStyle='rgba(0,140,255,0.12)';
+  ctx.fill();
+  ctx.strokeStyle='rgba(120,220,255,0.25)';
+  ctx.lineWidth=1.5; ctx.stroke();
+  ctx.restore();
+
+  // 배경 물고기
+  bgFish.forEach(f=>{
+    f.x+=f.speed*f.dir;
+    if(f.x>W+40){ f.x=-40; f.y=60+Math.random()*(H-160); }
+    if(f.x<-40){ f.x=W+40; f.y=60+Math.random()*(H-160); }
+    ctx.save();
+    ctx.globalAlpha=f.alpha;
+    ctx.font=f.size+'px serif';
+    ctx.scale(f.dir,1);
+    ctx.fillText('🐠', f.dir>0?f.x:-f.x, f.y);
+    ctx.restore();
+  });
+
+  // 바닥 해초
+  ctx.save();
+  for(let i=0;i<8;i++){
+    const bx=30+i*88, t=Date.now()/1000;
+    ctx.beginPath();
+    ctx.moveTo(bx,H);
+    ctx.bezierCurveTo(
+      bx+Math.sin(t+i)*12, H-30,
+      bx+Math.sin(t+i+1)*15, H-60,
+      bx+Math.sin(t+i+0.5)*10, H-80
+    );
+    ctx.strokeStyle=`rgba(0,${120+i*8},${60+i*5},0.35)`;
+    ctx.lineWidth=3+Math.random()*1.5;
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // 기포
+  bubbles.forEach(b=>{
+    b.y-=b.speed;
+    if(b.y<-10){ b.y=H+10; b.x=Math.random()*W; }
+    ctx.save();
+    ctx.globalAlpha=b.alpha;
+    ctx.beginPath();
+    ctx.arc(b.x,b.y,b.r,0,Math.PI*2);
+    ctx.strokeStyle='rgba(150,220,255,0.6)';
+    ctx.lineWidth=1;
+    ctx.stroke();
+    ctx.restore();
+  });
+}
+
+function drawPad(x,y,w,h) {
+  ctx.save();
+  // 연잎: 물 위에 뜬 느낌
+  ctx.beginPath();
+  ctx.ellipse(x,y,w/2,h/2,0,0,Math.PI*2);
+  ctx.fillStyle='#1a6b2a';
+  ctx.fill();
+  ctx.strokeStyle='#3dba5a';
+  ctx.lineWidth=2; ctx.stroke();
+  // 연잎 무늬
+  ctx.beginPath();
+  ctx.moveTo(x,y-h/2+2); ctx.lineTo(x,y+h/2-2);
+  ctx.strokeStyle='rgba(80,200,100,0.35)'; ctx.lineWidth=1.5; ctx.stroke();
+  // 수면 반사
+  ctx.beginPath();
+  ctx.ellipse(x,y+h/2+2,w/2*0.9,4,0,0,Math.PI*2);
+  ctx.fillStyle='rgba(0,120,200,0.18)'; ctx.fill();
+  ctx.restore();
+}
+
+function drawFrog(x,y,jumping,t) {
+  const r=18,progress=t/JUMP_DURATION;
+  let sx=1,sy=1;
+  if(jumping){ sx=progress<0.5?0.85:1.1; sy=progress<0.5?1.15:0.9; }
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.scale(sx*state.frog.facing,sy);
+  ctx.beginPath();
+  ctx.ellipse(0,2,r,r*0.85,0,0,Math.PI*2);
+  ctx.fillStyle='#4caf50'; ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(-r*.55,-r*.6,r*.38,r*.3,-0.3,0,Math.PI*2);
+  ctx.ellipse( r*.55,-r*.6,r*.38,r*.3, 0.3,0,Math.PI*2);
+  ctx.fillStyle='#66bb6a'; ctx.fill();
+  ctx.beginPath();
+  ctx.arc(-r*.38,-r*.55,r*.22,0,Math.PI*2);
+  ctx.arc( r*.38,-r*.55,r*.22,0,Math.PI*2);
+  ctx.fillStyle='#fff'; ctx.fill();
+  ctx.beginPath();
+  ctx.arc(-r*.38,-r*.55,r*.12,0,Math.PI*2);
+  ctx.arc( r*.38,-r*.55,r*.12,0,Math.PI*2);
+  ctx.fillStyle='#222'; ctx.fill();
+  ctx.beginPath();
+  ctx.arc(0,r*.25,r*.45,0.2,Math.PI-0.2);
+  ctx.strokeStyle='#2e7d32'; ctx.lineWidth=1.5; ctx.stroke();
+  const lc='#2e7d32';
+  if(jumping&&progress<0.5){
+    [[-r*.5,r*.3,-r*.3,0],[r*.5,r*.3,r*.3,0]].forEach(([x1,y1,x2,y2])=>{
+      ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);
+      ctx.strokeStyle=lc;ctx.lineWidth=3;ctx.stroke();
+    });
+  } else {
+    [[-r*.7,r*.5,-r,r*.9],[r*.7,r*.5,r,r*.9]].forEach(([x1,y1,x2,y2])=>{
+      ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);
+      ctx.strokeStyle=lc;ctx.lineWidth=3;ctx.stroke();
+    });
+  }
+  ctx.restore();
+}
+
+function drawLegend() {
+  ctx.fillStyle='rgba(0,20,60,0.65)';
+  ctx.roundRect(W-170,8,162,70,8);
+  ctx.fill();
+  ctx.font='13px serif';
+  ctx.fillStyle='rgba(255,255,255,0.9)';
+  ctx.fillText('🌸 꽃 → +10점', W-158,28);
+  ctx.fillText('🐛 애벌레 → +❤️ (희귀)',W-158,48);
+  ctx.fillText('🦅🐍🧑 → -❤️ 피하기',W-158,68);
+}
+
+function drawHUD() {
+  const lv=getLevel();
+  ctx.fillStyle='rgba(0,20,60,0.65)';
+  ctx.roundRect(8,8,165,68,8);
+  ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.font='500 13px sans-serif';
+  ctx.fillText('점수: '+state.score,18,28);
+  ctx.fillText('생명: '+'❤️'.repeat(state.lives),18,48);
+  // 레벨 표시
+  ctx.fillStyle='rgba(255,220,80,0.9)';
+  ctx.font='500 11px sans-serif';
+  ctx.fillText('LEVEL '+lv+'  '+(['','','★','★★','★★★','★★★★','★★★★★','★★★★★★','MAX'][lv]||''),18,66);
+
+  if(state.combo>=2&&state.comboTimer>0){
+    ctx.save();
+    ctx.globalAlpha=Math.min(1,state.comboTimer/30);
+    ctx.fillStyle='#ffca28';
+    ctx.font='500 18px sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText(state.combo+' 콤보!',W/2,36);
+    ctx.textAlign='left';
+    ctx.restore();
+  }
+
+  // 플래시 메시지들
+  state.flashMsgs.forEach(m=>{
+    ctx.save();
+    ctx.globalAlpha=m.life/m.maxLife;
+    ctx.fillStyle=m.color;
+    ctx.font='500 20px sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText(m.text,m.x,m.y);
+    ctx.textAlign='left';
+    ctx.restore();
+    m.y-=0.8; m.life--;
+  });
+  state.flashMsgs=state.flashMsgs.filter(m=>m.life>0);
+}
+
+function update() {
+  if(state.over||!state.started) return;
+  state.frame++;
+  const f=state.frog, p=state.pad;
+  const d=getDifficulty();
+
+  if(state.keys['ArrowLeft'])  p.targetX-=11;
+  if(state.keys['ArrowRight']) p.targetX+=11;
+  p.targetX=Math.max(p.w/2+5,Math.min(W-p.w/2-5,p.targetX));
+  p.x+=(p.targetX-p.x)*0.30;
+
+  if(f.jumping){
+    f.jumpT++;
+    const t=f.jumpT/JUMP_DURATION;
+    f.x=f.jumpFromX+(f.jumpToX-f.jumpFromX)*easeInOut(t);
+    f.displayY=FROG_BASE_Y-Math.sin(t*Math.PI)*JUMP_HEIGHT;
+    if(f.jumpT>=JUMP_DURATION){
+      f.jumping=false; f.x=f.jumpToX; f.displayY=FROG_BASE_Y;
+      p.x=f.x; p.targetX=f.x;
+    }
+  } else {
+    f.x=p.x; f.displayY=FROG_BASE_Y;
+  }
+
+  // 스폰
+  state.spawnTimer--;
+  if(state.spawnTimer<=0){
+    const bad=Math.random()<d.badRatio;
+    spawnItem(bad?'bad':'good');
+    // 고레벨에서 동시 2개 스폰
+    if(Math.random()<d.multiChance) spawnItem(Math.random()<0.4?'bad':'good');
+    state.spawnTimer=d.spawnInt;
+  }
+  state.bonusTimer--;
+  if(state.bonusTimer<=0){
+    spawnItem('bonus');
+    state.bonusTimer=state.bonusInterval+(Math.random()*200|0);
+  }
+
+  state.items.forEach(item=>{
+    if(!item.alive) return;
+    item.x+=item.vx; item.y+=item.vy;
+    const dist=Math.hypot(item.x-f.x,item.y-f.displayY);
+    if(dist<item.r+18){
+      item.alive=false;
+      spawnParticle(item.x,item.y,item.emoji,item.kind);
+      if(item.kind==='good'){
+        state.combo++; state.comboTimer=90;
+        const bonus=state.combo>=3?state.combo:1;
+        const pts=10*bonus;
+        state.score+=pts;
+        addFlash('+'+pts,item.x,item.y-10,'#69f0ae');
+      } else if(item.kind==='bonus'){
+        state.lives=Math.min(state.lives+1,5);
+        addFlash('+❤️',item.x,item.y-10,'#ff80ab');
+      } else {
+        state.combo=0; state.lives--;
+        addFlash('-❤️',item.x,item.y-10,'#ff5252');
+        if(state.lives<=0) state.over=true;
+      }
+    }
+    if(item.y>H+40){ item.alive=false; if(item.kind==='good') state.combo=0; }
+  });
+  state.items=state.items.filter(it=>it.alive);
+  if(state.comboTimer>0) state.comboTimer--;
+  else state.combo=0;
+
+  state.particles.forEach(pt=>{ pt.x+=pt.vx;pt.y+=pt.vy;pt.vy+=0.12;pt.life--; });
+  state.particles=state.particles.filter(pt=>pt.life>0);
+}
+
+function draw() {
+  drawUnderwater();
+
+  state.items.forEach(item=>{
+    if(!item.alive) return;
+    ctx.font='32px serif';
+    ctx.fillText(item.emoji,item.x-16,item.y+12);
+    if(item.kind==='bad'){
+      ctx.beginPath();
+      ctx.arc(item.x,item.y,item.r+5,0,Math.PI*2);
+      ctx.strokeStyle='rgba(255,80,80,0.55)';
+      ctx.lineWidth=2.5; ctx.stroke();
+    }
+    if(item.kind==='bonus'){
+      ctx.beginPath();
+      ctx.arc(item.x,item.y,item.r+5,0,Math.PI*2);
+      ctx.strokeStyle='rgba(100,255,150,0.65)';
+      ctx.lineWidth=2.5; ctx.stroke();
+    }
+  });
+
+  state.particles.forEach(pt=>{
+    ctx.save();
+    ctx.globalAlpha=pt.life/pt.maxLife;
+    ctx.font='18px serif';
+    ctx.fillText(pt.emoji,pt.x-9,pt.y+7);
+    ctx.restore();
+  });
+
+  drawPad(state.pad.x,state.pad.y,state.pad.w,state.pad.h);
+  drawFrog(state.frog.x,state.frog.displayY,state.frog.jumping,state.frog.jumpT);
+  drawHUD();
+  drawLegend();
+
+  if(!state.started){
+    ctx.fillStyle='rgba(0,10,40,0.72)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.fillStyle='#7dd3fc';
+    ctx.font='500 24px sans-serif';
+    ctx.fillText('🐸 개구리 점프 게임',W/2,H/2-65);
+    ctx.font='16px serif';
+    ctx.fillStyle='#e0f2fe';
+    ctx.fillText('🌸 꽃 먹기  |  🐛 애벌레 → 생명+1  |  🦅🐍🧑 피하기',W/2,H/2-22);
+    ctx.font='13px sans-serif';
+    ctx.fillStyle='rgba(180,220,255,0.8)';
+    ctx.fillText('시간이 지날수록 빨라지고 포식자가 많아집니다',W/2,H/2+10);
+    ctx.fillText('← → 키 / 마우스로 연잎 이동  |  클릭으로 개구리 점프',W/2,H/2+34);
+    ctx.fillText('클릭하거나 화면을 터치해서 시작',W/2,H/2+60);
+    ctx.textAlign='left';
+  }
+
+  if(state.over){
+    ctx.fillStyle='rgba(0,10,40,0.75)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.fillStyle='#ff6b6b';
+    ctx.font='500 28px sans-serif';
+    ctx.fillText('게임 오버!',W/2,H/2-20);
+    ctx.fillStyle='#e0f2fe';
+    ctx.font='18px sans-serif';
+    ctx.fillText('최종 점수: '+state.score+'  |  LEVEL '+getLevel(),W/2,H/2+14);
+    ctx.fillStyle='rgba(150,200,255,0.7)';
+    ctx.font='14px sans-serif';
+    ctx.fillText('"다시 시작" 버튼을 누르거나 클릭하세요',W/2,H/2+44);
+    ctx.textAlign='left';
+  }
+}
+
+function loop(){ update(); draw(); requestAnimationFrame(loop); }
+
+canvas.addEventListener('mousemove',e=>{
+  const rect=canvas.getBoundingClientRect();
+  const mx=(e.clientX-rect.left)*(W/rect.width);
+  state.pad.targetX=Math.max(state.pad.w/2+5,Math.min(W-state.pad.w/2-5,mx));
+});
+canvas.addEventListener('click',e=>{
+  if(!state.started||state.over){ resetGame(); return; }
+  const rect=canvas.getBoundingClientRect();
+  triggerJump((e.clientX-rect.left)*(W/rect.width));
+});
+canvas.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  const rect=canvas.getBoundingClientRect();
+  state.pad.targetX=Math.max(state.pad.w/2+5,Math.min(W-state.pad.w/2-5,(e.touches[0].clientX-rect.left)*(W/rect.width)));
+},{passive:false});
+canvas.addEventListener('touchstart',e=>{
+  e.preventDefault();
+  if(!state.started||state.over){ resetGame(); return; }
+  const rect=canvas.getBoundingClientRect();
+  triggerJump((e.touches[0].clientX-rect.left)*(W/rect.width));
+},{passive:false});
+document.addEventListener('keydown',e=>{
+  state.keys[e.key]=true;
+  if(!state.started||state.over){ resetGame(); return; }
+  if(e.key===' ') triggerJump(state.pad.targetX);
+});
+document.addEventListener('keyup',e=>{ state.keys[e.key]=false; });
+document.getElementById('restartBtn').addEventListener('click',resetGame);
+
+loop();
+</script>
